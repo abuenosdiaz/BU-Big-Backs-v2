@@ -303,7 +303,3 @@ def main() -> pd.DataFrame:
 
 if __name__ == "__main__":
     main()
-
-
-# Load the JSON file at JSON_PATH into a DataFrame and save it to this variable.
-marcianosdf = load_menu_df(JSON_PATH)
