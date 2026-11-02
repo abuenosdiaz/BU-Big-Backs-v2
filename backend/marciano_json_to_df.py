@@ -51,13 +51,42 @@ import pandas as pd
 
 # ======================================================================
 # USER SETTING: specify the path to your menu JSON file here.
-# Change the value below to the location of the JSON file you want to
-# parse. It can be a plain file name (if the file sits next to this
-# script) or a full path such as r"C:\Users\you\Downloads\marciano.json".
+#
+# By default this resolves to the most recent dated snapshot folder under
+# ``data/`` that contains a ``menu_marciano.json`` (the poller keeps a
+# rolling window of day-folders and prunes old ones, so a hardcoded date
+# would go stale). To parse a specific file instead, set JSON_PATH to a
+# plain file name (if it sits next to this script) or a full path such as
+# r"C:\Users\you\Downloads\marciano.json".
 # ======================================================================
-JSON_PATH = str(
-    Path(__file__).resolve().parent / "data" / "2026-10-24" / "menu_marciano.json"
-)
+DATA_DIR = Path(__file__).resolve().parent / "data"
+MENU_FILENAME = "menu_marciano.json"
+
+
+def _latest_menu_path() -> Path:
+    """Return the newest dated ``data/`` folder that has the marciano menu.
+
+    Day folders are named ``YYYY-MM-DD``, so a reverse lexicographic sort
+    puts the most recent date first. Falls back to a plain path under the
+    newest-looking folder when nothing matches, so the error message in
+    ``main`` still points somewhere sensible.
+    """
+    if DATA_DIR.exists():
+        candidates = sorted(
+            (child for child in DATA_DIR.iterdir() if child.is_dir()),
+            key=lambda child: child.name,
+            reverse=True,
+        )
+        for child in candidates:
+            menu_file = child / MENU_FILENAME
+            if menu_file.exists():
+                return menu_file
+
+    # Nothing found; return a best-effort path for a helpful error message.
+    return DATA_DIR / MENU_FILENAME
+
+
+JSON_PATH = str(_latest_menu_path())
 
 # Optional: set to a file name to also write the flattened rows as CSV,
 # or leave as None to skip writing a CSV.

@@ -34,7 +34,9 @@ function ProfilePage() {
     .slice(0, 3);
   const list = (tab === "starred" ? profile.starred : profile.disliked).map((id) => byId.get(id)).filter(Boolean);
   const restrictions = [...profile.diets, ...profile.avoid.map((a) => `No ${a.toLowerCase()}`)];
-  const meal = currentMeal();
+  // Empty string when nothing is being served now (before open), so the
+  // "being served now" check simply reads false rather than matching a meal.
+  const meal = currentMeal() ?? "";
   const initial = (profile.name || "?").trim()[0]?.toUpperCase();
 
   return (

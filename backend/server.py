@@ -71,6 +71,11 @@ from urllib.parse import parse_qs, urlparse
 BACKEND_DIR = Path(__file__).resolve().parent
 DATA_DIR = BACKEND_DIR / "data"
 
+# Permanent, never-pruned archive of past days (see dining_poller.ARCHIVE_DIR).
+# The API serves days from here as well as the live window, so the calendar can
+# reach back through the full history. Overridable with ARCHIVE_DIR.
+ARCHIVE_DIR = Path(os.environ.get("ARCHIVE_DIR", str(BACKEND_DIR / "data_archive")))
+
 # Static list of dining locations. The set of halls rarely changes, so it is
 # kept as a constant file here instead of being polled daily.
 LOCATIONS_FILE = BACKEND_DIR / "locations.json"
@@ -302,6 +307,7 @@ def _build_items():
     defaults.
     """
     try:
+        import pandas as pd
         from collect_menu_dfs import collect_menu_dataframes
     except Exception as exc:  # ImportError, or pandas import failure
         raise BackendUnavailable(
@@ -309,13 +315,32 @@ def _build_items():
             f"(e.g. pandas) are installed. Original error: {exc}"
         ) from exc
 
-    if not DATA_DIR.exists():
+    # Read both the permanent archive (full history) and the live rolling
+    # window. Either may be absent; we fail only when neither has data.
+    frames = []
+    for root in (ARCHIVE_DIR, DATA_DIR):
+        if root.exists():
+            part = collect_menu_dataframes(root)
+            if not part.empty:
+                frames.append(part)
+
+    if not frames:
         raise BackendUnavailable(
-            f"No menu data found at {DATA_DIR} yet. The poller runs on startup; "
-            "wait for its first run to finish, then retry."
+            f"No menu data found at {DATA_DIR} (or archive {ARCHIVE_DIR}) yet. "
+            "The poller runs on startup; wait for its first run to finish, "
+            "then retry."
         )
 
-    return collect_menu_dataframes(DATA_DIR)
+    combined = pd.concat(frames, ignore_index=True)
+
+    # The same day can appear in both the archive and the live window; keep one
+    # row per (date, hall, item, meal, station) so days aren't double-counted.
+    key_cols = [c for c in ("date", "location_id", "item_id", "meal", "station")
+                if c in combined.columns]
+    if key_cols:
+        combined = combined.drop_duplicates(subset=key_cols).reset_index(drop=True)
+
+    return combined
 
 
 CACHE = DataCache(CACHE_TTL_SECONDS)
@@ -523,7 +548,7 @@ def data_metadata():
     }
 
 
-def data_stats():
+def data_stats(params=None):
     """Unified statistics: an overall rollup plus the per-hall summary.
 
     ``overall`` aggregates across every hall (totals, dietary percentages, mean
@@ -531,15 +556,79 @@ def data_stats():
     from ``dining_diet_analysis.build_hall_summary`` (average nutrition,
     dietary totals/percentages, and first-day vs last-day change). One endpoint
     covers both the headline numbers and the per-hall detail.
+
+    When a ``date`` query parameter is supplied, the stats are scoped to just
+    that service day (case-insensitive exact match on the ``date`` column), so
+    the UI's day picker can show single-day stats. Without it, the stats span
+    every day in the data, as before. ``scope_date`` in the response echoes the
+    day actually applied (or ``None`` for the full window).
     """
     from dining_diet_analysis import build_hall_summary
+    from datetime import date as _date, timedelta as _timedelta
 
-    items = CACHE.get()
-    if items.empty:
-        return {"overall": None, "halls": []}
+    params = params or {}
+    scope_date = params.get("date")
+
+    all_items = CACHE.get()
+    if all_items.empty:
+        return {"overall": None, "halls": [], "scope_date": None, "next_week": None}
+
+    # ``next_week`` describes the week-over-week comparison when a single day is
+    # selected: the same weekday seven days later. It is None for the full-window
+    # view. ``available`` is False when that following-week day has no data, so
+    # the UI can say "No data is present for the following week".
+    next_week = None
+
+    items = all_items
+    # Scope to a single service day when requested.
+    if scope_date and "date" in items.columns:
+        items = items[
+            items["date"].astype(str).str.casefold() == str(scope_date).casefold()
+        ]
+        if items.empty:
+            # The requested day has no data; report an empty-but-valid payload
+            # rather than erroring, so the client can show "no data" cleanly.
+            return {"overall": None, "halls": [], "scope_date": scope_date, "next_week": None}
+
+        # Determine the same weekday one week later for the change comparison.
+        try:
+            nxt = (_date.fromisoformat(str(scope_date)) + _timedelta(days=7)).isoformat()
+        except ValueError:
+            nxt = None
+        next_rows = (
+            all_items[all_items["date"].astype(str) == nxt]
+            if nxt and "date" in all_items.columns
+            else all_items.iloc[0:0]
+        )
+        next_week = {"date": nxt, "available": not next_rows.empty}
 
     summary = build_hall_summary(items)
     halls = _records(summary)
+
+    # For a single selected day, recompute each hall's ``change_*`` as the
+    # week-over-week difference: (count on scope_date + 7 days) - (count on
+    # scope_date). build_hall_summary's own change is first-day vs last-day,
+    # which is always 0 within a single day, so we override it here.
+    if scope_date:
+        def _counts_for(rows):
+            out = {}
+            for hall, g in rows.groupby("location_name", sort=False):
+                out[str(hall)] = {flag: int(g[flag].fillna(False).astype(bool).sum())
+                                  for flag in DIET_FLAGS if flag in g.columns}
+            return out
+
+        this_counts = _counts_for(items)
+        next_counts = _counts_for(next_rows) if (next_week and next_week["available"]) else {}
+        for hall in halls:
+            name = hall.get("dining_hall")
+            tc = this_counts.get(name, {})
+            nc = next_counts.get(name, {})
+            for flag in DIET_FLAGS:
+                if next_week and next_week["available"]:
+                    hall[f"change_{flag}"] = nc.get(flag, 0) - tc.get(flag, 0)
+                else:
+                    # No following-week data: change is not meaningful.
+                    hall[f"change_{flag}"] = None
 
     # Overall rollup computed directly from the item frame.
     import pandas as pd
@@ -572,7 +661,7 @@ def data_stats():
         },
     }
 
-    return {"overall": overall, "halls": halls}
+    return {"overall": overall, "halls": halls, "scope_date": scope_date, "next_week": next_week}
 
 
 def _first_or_none(df, column):
@@ -999,7 +1088,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._handle_items(route, params)
                 return
             if route == "/api/stats":
-                self._send_json(data_stats())
+                self._send_json(data_stats(params))
                 return
 
             self._send_error_json(404, f"Unknown API route: {route}")

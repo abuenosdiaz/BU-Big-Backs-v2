@@ -18,7 +18,7 @@ export default defineConfig({
     server: {
       // Forward /api to the Python integration server (backend/server.py).
       proxy: {
-        "/api": `http://127.0.0.1:${process.env.SERVER_PORT ?? "8000"}`,
+        "/api": `http://127.0.0.1:${process.env["SERVER_PORT"] ?? "8000"}`,
       },
     },
   },
