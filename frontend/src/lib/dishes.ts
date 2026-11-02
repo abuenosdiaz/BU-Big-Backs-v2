@@ -1,8 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
-import { getMenu, type MenuRow } from "@/lib/api";
+import { getMenu, getMetadata, type MenuRow } from "@/lib/api";
 import { requireBuUser, toastWriteError, useAuth } from "@/lib/auth";
 import aiPhotos from "@/lib/dish-images.json";
+import { useSelectedDate } from "@/lib/menu-date";
 import { toAllergens } from "@/lib/profile";
 
 const images = import.meta.glob("@/assets/dishes/*.jpg", { eager: true, import: "default" }) as Record<
@@ -99,8 +100,35 @@ const DIET_TAGS = [
 ] as const;
 
 /** Today's date in Boston, as the API's YYYY-MM-DD service date. */
-function today() {
+export function today() {
   return new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+}
+
+/**
+ * Pick the service date to show.
+ *
+ * Priority:
+ *   1. An explicit `override` the user picked in the header calendar, when that
+ *      day is actually available.
+ *   2. Today (Boston time), when the backend has it.
+ *   3. Otherwise the most recent available day (the backend keeps a rolling
+ *      window and the newest/edge days can be temporarily missing), falling
+ *      back to the earliest upcoming day if all data is in the future.
+ *
+ * Returns `null` only when the backend has no dates at all. An override for a
+ * day that is no longer available is ignored, so a stale saved choice can never
+ * leave the app stuck on an empty page.
+ */
+function resolveMenuDate(available: string[], override?: string | null): string | null {
+  if (override && available.includes(override)) return override;
+  const t = today();
+  if (available.includes(t)) return t;
+  if (available.length === 0) return null;
+  // Dates are YYYY-MM-DD, so lexical max is the latest available day.
+  const past = available.filter((d) => d <= t);
+  // Prefer the most recent day on or before today; otherwise the earliest
+  // upcoming day. Either way we land on a day the backend can actually serve.
+  return (past.length ? past : available).reduce((a, b) => (a > b ? a : b));
 }
 
 // An item can be served at several halls, so the dish id includes the hall.
@@ -134,15 +162,49 @@ function toDish(r: MenuRow, sort: number): Omit<Dish, "loves" | "loved" | "comme
  * Today's dishes. `avoid` takes profile "avoid" choices (e.g. "Dairy"); the API drops
  * dishes whose ingredients contain them, and dishes with unknown ingredients.
  */
+/**
+ * The service date currently being shown, plus everything the header's date
+ * picker needs: the full list of available days, the resolved day, whether it
+ * is today, and whether the user has an explicit override active.
+ *
+ * `date` resolves to the same day `useDishes` requests: the user's picked day
+ * when available, else today, else the most recent available day. Returns
+ * `null` for the date only when the backend has no menu data at all.
+ */
+export function useMenuDate() {
+  const override = useSelectedDate();
+  return useQuery({
+    queryKey: ["menu-date", override],
+    queryFn: async () => {
+      const meta = await getMetadata();
+      const available = (meta.dates ?? []).slice().sort();
+      const date = resolveMenuDate(available, override);
+      return {
+        date,
+        available,
+        isToday: date === today(),
+        isOverride: !!override && available.includes(override),
+      };
+    },
+  });
+}
+
 export function useDishes(avoid: string[] = []) {
   // Keyed by user so "loved" refreshes on sign-in and sign-out.
   const user = useAuth();
+  const override = useSelectedDate();
   const exclude = [...new Set(toAllergens(avoid))].sort().join(",");
   return useQuery({
-    queryKey: ["dishes", user?.id ?? null, exclude],
+    // Keyed by the selected day so switching days refetches the right menu.
+    queryKey: ["dishes", user?.id ?? null, exclude, override],
     queryFn: async () => {
+      // Resolve which day to show: the user's picked day when available, else
+      // today, else the latest day the backend has. This keeps the menu
+      // populated even when the current date's folder is missing.
+      const meta = await getMetadata();
+      const date = resolveMenuDate((meta.dates ?? []).slice().sort(), override);
       const [menu, stats] = await Promise.all([
-        getMenu({ date: today(), ...(exclude && { exclude_allergens: exclude }) }),
+        getMenu({ ...(date ? { date } : {}), ...(exclude && { exclude_allergens: exclude }) }),
         supabase.rpc("get_dish_stats"),
       ]);
       // Votes are optional: still show the menu if Supabase is unavailable.
