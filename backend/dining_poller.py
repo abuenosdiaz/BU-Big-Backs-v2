@@ -1,13 +1,15 @@
-"""Poll the BU dining API for the upcoming two-week window.
+"""Poll the BU dining API for the upcoming one-week-ahead window.
 
 Each run of this script:
 
     1. Reads ``API_KEY`` from the ``.env`` file.
-    2. Walks the window of today through today + 13 (14 days total). For
-       each day that does not already have a folder, it requests the
-       dining locations and each location's menu for that day and writes
-       the JSON responses into the day's folder. Days that already exist
-       are left untouched.
+    2. Walks the window of today through today + 7 (8 days total). The
+       first and last day share the same weekday (e.g. Monday through the
+       following Monday), so week-over-week comparisons line up. For each
+       day that does not already have a folder, it requests the dining
+       locations and each location's menu for that day and writes the JSON
+       responses into the day's folder. Days that already exist are left
+       untouched.
     3. Deletes any folder in the ``data`` directory whose date falls
        outside the window -- past days as well as anything beyond the
        end of the window.
@@ -25,6 +27,12 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+# BU's dining calendar (and the web app) operate in Boston local time, so the
+# day window must be computed in this zone, not UTC. Using UTC caused the
+# poller to skip the real "today" for several hours each night.
+CAMPUS_TZ = ZoneInfo("America/New_York")
 
 # ==================================================
 # 1. Configuration
@@ -56,13 +64,24 @@ ENV_FILE = REPO_ROOT / ".env"
 # Snapshots are written here, one subfolder per day (``YYYY-MM-DD``).
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
+# Permanent archive of every day ever collected, one subfolder per day
+# (``YYYY-MM-DD``). Unlike DATA_DIR -- a rolling window that is pruned -- the
+# archive is never pruned, so the web app's calendar can reach back through the
+# full history. Each poll copies any complete day into the archive. Can be
+# overridden with the ARCHIVE_DIR env var (e.g. to a shared drive).
+ARCHIVE_DIR = Path(
+    os.environ.get("ARCHIVE_DIR", str(Path(__file__).resolve().parent / "data_archive"))
+)
+
 # Folder-name format for a day's snapshot directory.
 DAY_FORMAT = "%Y-%m-%d"
 
 # How many days in advance to cover. The window is today plus the next
 # DAYS_AHEAD days, i.e. it ends on today + DAYS_AHEAD. A folder is kept
-# only when its date falls inside that range.
-DAYS_AHEAD = 6
+# only when its date falls inside that range. With DAYS_AHEAD = 7 the last
+# day lands on the same weekday as today (e.g. Monday through the following
+# Monday), so the stats compare matching weekdays a week apart.
+DAYS_AHEAD = 7
 
 # Total number of day-folders in the window (today plus DAYS_AHEAD days).
 WINDOW_DAYS = DAYS_AHEAD + 1
@@ -149,9 +168,15 @@ def timestamp_label():
 
 
 def today():
-    """Return today's UTC date."""
+    """Return today's date in Boston (America/New_York).
 
-    return datetime.now(timezone.utc).date()
+    BU's menu API validates ``day`` against its own Eastern-time clock, and the
+    web app requests menus by Boston date, so the poller's window must be
+    anchored to the same zone. Computing this in UTC would, for the hours when
+    UTC has already rolled to the next day, skip the genuine current day.
+    """
+
+    return datetime.now(CAMPUS_TZ).date()
 
 
 def window_dates():
@@ -191,6 +216,49 @@ def remove_dir(path):
         else:
             item.rmdir()
     path.rmdir()
+
+
+def archive_completed_days():
+    """Copy every complete day in DATA_DIR into the permanent ARCHIVE_DIR.
+
+    The archive preserves days after they roll out of the rolling window, so the
+    web app's calendar can reach backwards indefinitely. A day is copied only
+    when it is complete (a menu file for every known location), so partially
+    fetched days are never archived in a broken state. An already-archived day
+    is refreshed in place (the newest complete copy wins), and the archive is
+    never pruned. Returns the number of day-folders archived or refreshed.
+    """
+
+    if not DATA_DIR.exists():
+        return 0
+
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    archived = 0
+
+    for child in sorted(DATA_DIR.iterdir()):
+        if not child.is_dir():
+            continue
+        # Only archive real dated folders.
+        try:
+            day = datetime.strptime(child.name, DAY_FORMAT).date()
+        except ValueError:
+            continue
+        if not day_is_complete(day):
+            continue
+
+        dest = ARCHIVE_DIR / child.name
+        dest.mkdir(parents=True, exist_ok=True)
+        for src_file in child.glob("*.json"):
+            dest_file = dest / src_file.name
+            dest_file.write_bytes(src_file.read_bytes())
+        archived += 1
+
+    if archived:
+        print(
+            f"  Archived {archived} complete day(s) to {ARCHIVE_DIR}.",
+            flush=True,
+        )
+    return archived
 
 
 def prune_out_of_window():
@@ -424,13 +492,13 @@ def poll_day(api_key, day):
 # ==================================================
 
 def main():
-    """Confirm locations, then maintain the 7-day menu window.
+    """Confirm locations, then maintain the 8-day menu window.
 
     1. Confirm the stored locations against the live API. If they changed,
        regenerate every day's menus from scratch (so the new hall set is
        reflected everywhere).
-    2. Ensure the 7-day window is present: poll any missing/incomplete day,
-       leave complete days untouched.
+    2. Ensure the 8-day window (today through today + 7) is present: poll
+       any missing/incomplete day, leave complete days untouched.
     3. Prune day folders outside the window and add new in-range days.
     """
 
@@ -487,6 +555,10 @@ def main():
                 "on a future run.",
                 flush=True,
             )
+
+    # Preserve every complete day in the permanent archive BEFORE pruning, so
+    # days that are about to roll out of the window are kept for the calendar.
+    archive_completed_days()
 
     # Tidy up folders outside the forward window (past days and beyond).
     prune_out_of_window()

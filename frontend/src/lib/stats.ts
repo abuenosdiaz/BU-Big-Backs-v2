@@ -16,13 +16,14 @@ export const short = (h: HallStats) =>
 export function findings(s: Stats) {
   const out: string[] = [];
   const halls = s.halls;
-  if (halls.length < 2) return out;
+  const overall = s.overall;
+  if (!overall || halls.length < 2) return out;
 
   // Cool Food is BU's low-carbon label, not a diet anyone has to follow.
   const rarest = DIET_KEYS.filter((k) => k !== "cool_food").sort(
-    (a, b) => s.overall.percent[a] - s.overall.percent[b],
+    (a, b) => overall.percent[a] - overall.percent[b],
   )[0]!;
-  const rare = s.overall.percent[rarest];
+  const rare = overall.percent[rarest];
   out.push(
     `${DIET_LABEL[rarest]} is the hardest diet to eat on: only ${pct(rare)} of items fit it, about 1 in ${Math.round(100 / rare)}.`,
   );
@@ -60,7 +61,9 @@ export function findings(s: Stats) {
     `${short(cHi)} serves the heaviest food: ${Math.round(cHi.avg_calories)} calories per item on average, ${Math.round(((cHi.avg_calories - cLo.avg_calories) / cLo.avg_calories) * 100)}% more than ${short(cLo)} (${Math.round(cLo.avg_calories)}).`,
   );
 
-  const moves = halls.flatMap((h) => DIET_KEYS.map((k) => ({ h, k, d: h[`change_${k}`] })));
+  const moves = halls
+    .flatMap((h) => DIET_KEYS.map((k) => ({ h, k, d: h[`change_${k}`] })))
+    .filter((m): m is { h: HallStats; k: DietKey; d: number } => m.d != null);
   const big = [...moves].sort((a, b) => Math.abs(b.d) - Math.abs(a.d))[0];
   if (big && big.d !== 0) {
     out.push(

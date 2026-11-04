@@ -12,6 +12,7 @@ import {
 } from "recharts";
 import { PageShell } from "@/components/SiteHeader";
 import { DIET_KEYS, getStats, type HallStats } from "@/lib/api";
+import { useMenuDate } from "@/lib/dishes";
 import { HALLS } from "@/lib/halls";
 import { DIET_LABEL, findings, pct, short } from "@/lib/stats";
 
@@ -49,28 +50,57 @@ const byHallOrder = (halls: HallStats[]) =>
   );
 
 function StatsPage() {
-  const { data, isLoading, error } = useQuery({ queryKey: ["stats"], queryFn: getStats });
+  // Always scope the stats to the day currently being shown -- whether that's
+  // an explicitly picked day or the auto-resolved current day. The change
+  // table then uniformly compares that day to the same weekday one week LATER,
+  // so the current day behaves like any other: it only ever references a future
+  // day, never the window's other end. (Previously, auto/today mode used the
+  // whole-window summary, which compared the window's first and last days and
+  // produced a caption referring to days other than the one shown.)
+  const menuDate = useMenuDate();
+  const scopeDate = menuDate.data?.date ?? null;
+  // The current day can never have a real week-over-week comparison: the same
+  // weekday a week later hasn't happened yet. Even if a forward-polled folder
+  // for that future date exists, we don't treat it as observed history, so the
+  // change table for today always reports "not enough future data".
+  const scopeIsToday = !!menuDate.data?.isToday;
+  const { data, isLoading, error } = useQuery({
+    queryKey: ["stats", scopeDate],
+    queryFn: () => getStats(scopeDate),
+  });
 
   return (
     <PageShell>
-      <p className="eyebrow">This week's menus</p>
+      <p className="eyebrow">{scopeDate ? "Menu for one day" : "This week's menus"}</p>
       <h1 className="page-title mt-2">How the dining halls compare</h1>
-      {data && (
+      {data?.overall && (
         <p className="mt-3 max-w-2xl text-muted-foreground">
-          Every item on BU's menus from {data.overall.first_day} to {data.overall.last_day}, across{" "}
-          {data.overall.halls} dining halls.
+          {data.scope_date ? (
+            <>Every item on BU's menus for {data.scope_date}, across {data.overall.halls} dining halls.</>
+          ) : (
+            <>Every item on BU's menus from {data.overall.first_day} to {data.overall.last_day}, across {data.overall.halls} dining halls.</>
+          )}
         </p>
       )}
 
       {error && <p className="mt-10 text-destructive">Couldn't load the stats. Try refreshing.</p>}
       {isLoading && <div className="mt-10 h-64 animate-pulse rounded-2xl bg-muted" />}
 
-      {data && (
+      {data && !data.overall && !isLoading && (
+        <p className="mt-10 text-muted-foreground">
+          No menu data yet. Once the dining menus load, the comparison will appear here.
+        </p>
+      )}
+
+      {data?.overall && (
+        (() => {
+          const overall = data.overall;
+          return (
         <>
           <section className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
-            <Kpi label="Menu items" value={data.overall.total_items.toLocaleString()} />
+            <Kpi label="Menu items" value={overall.total_items.toLocaleString()} />
             {(["vegetarian", "vegan", "halal", "gluten_free"] as const).map((k) => (
-              <Kpi key={k} label={DIET_LABEL[k]} value={pct(data.overall.percent[k])} />
+              <Kpi key={k} label={DIET_LABEL[k]} value={pct(overall.percent[k])} />
             ))}
           </section>
 
@@ -85,7 +115,13 @@ function StatsPage() {
 
           <DietChart halls={byHallOrder(data.halls)} />
           <NutritionTable halls={byHallOrder(data.halls)} />
-          <ChangeTable halls={byHallOrder(data.halls)} />
+          <ChangeTable
+            halls={byHallOrder(data.halls)}
+            scopeDate={data.scope_date}
+            // Force "no future data" for the current day: a full week hasn't
+            // elapsed, so there is nothing real to compare it against.
+            nextWeek={scopeIsToday ? { date: null, available: false } : data.next_week}
+          />
 
           <p className="mt-8 max-w-3xl text-xs text-muted-foreground">
             From the menu API's per-hall summary (backend/dining_diet_analysis.py). An item counts
@@ -93,6 +129,8 @@ function StatsPage() {
             items are BU's lower-carbon picks. Nutrition is per item as listed by BU Dining.
           </p>
         </>
+          );
+        })()
       )}
     </PageShell>
   );
@@ -252,16 +290,60 @@ function NutritionTable({ halls }: { halls: HallStats[] }) {
   );
 }
 
-function ChangeTable({ halls }: { halls: HallStats[] }) {
+function ChangeTable({
+  halls,
+  scopeDate,
+  nextWeek,
+}: {
+  halls: HallStats[];
+  scopeDate: string | null;
+  nextWeek: { date: string | null; available: boolean } | null;
+}) {
   const first = halls[0];
+
+  // The comparison for a day is that day vs. the same weekday one week later.
+  // If that following-week day has no data (which is always the case for the
+  // current day -- next week hasn't happened yet), we cannot compute a change,
+  // so say so clearly instead of showing zeros or referencing another day.
+  if (scopeDate && (!nextWeek || !nextWeek.available)) {
+    return (
+      <section className="panel mt-8">
+        <h2 className="section-title">Change over the week</h2>
+        <p className="mt-2 text-muted-foreground">
+          There isn't enough data in the future to compare this day with the following week yet.
+        </p>
+        {nextWeek?.date && (
+          <p className="mt-1 text-sm text-muted-foreground">
+            A comparison will appear once {nextWeek.date} has been collected.
+          </p>
+        )}
+      </section>
+    );
+  }
+
+  // Are two YYYY-MM-DD dates exactly seven days apart?
+  const isOneWeekApart = (a?: string | null, b?: string | null) => {
+    if (!a || !b) return false;
+    const ms = Math.abs(Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`));
+    return ms === 7 * 24 * 60 * 60 * 1000;
+  };
+
+  // Caption only when the two days being compared are genuinely a week apart,
+  // so we never label a mismatched pair (e.g. a partial window) as a
+  // week-over-week comparison. Otherwise show no date pairing at all.
+  const fullWeekApart = !scopeDate && first && isOneWeekApart(first.first_day, first.last_day);
+  const caption = scopeDate
+    ? `Items that fit each diet on ${nextWeek?.date}, compared with ${scopeDate} (one week earlier).`
+    : fullWeekApart
+      ? `Items that fit each diet on ${first.last_day}, compared with ${first.first_day} (one week earlier).`
+      : first
+        ? `Change in items that fit each diet from ${first.first_day} to ${first.last_day}.`
+        : "";
+
   return (
     <section className="panel mt-8 overflow-x-auto">
       <h2 className="section-title">Change over the week</h2>
-      {first && (
-        <p className="mt-1 text-sm text-muted-foreground">
-          Items that fit each diet on {first.last_day}, compared with {first.first_day}.
-        </p>
-      )}
+      {caption && <p className="mt-1 text-sm text-muted-foreground">{caption}</p>}
       <table className="mt-4 w-full min-w-[520px] text-left tabular-nums">
         <thead className="text-sm text-muted-foreground">
           <tr>
@@ -281,7 +363,7 @@ function ChangeTable({ halls }: { halls: HallStats[] }) {
                 const d = h[`change_${k}`];
                 return (
                   <td key={k} className="py-2">
-                    {d > 0 ? `▲ +${d}` : d < 0 ? `▼ ${d}` : "— 0"}
+                    {d == null ? "—" : d > 0 ? `▲ +${d}` : d < 0 ? `▼ ${d}` : "— 0"}
                   </td>
                 );
               })}

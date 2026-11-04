@@ -83,9 +83,12 @@ export type HallStats = {
   avg_carbohydrates_grams: number;
   avg_protein_grams: number;
   avg_saturated_fat_grams: number;
-} & Record<`total_${DietKey}` | `percent_${DietKey}` | `change_${DietKey}`, number>;
+} & Record<`total_${DietKey}` | `percent_${DietKey}`, number>
+  // change_* is null when there's no following-week data to compare against.
+  & Record<`change_${DietKey}`, number | null>;
 
 export type Stats = {
+  /** Null when there is no data for the requested scope (e.g. an empty day). */
   overall: {
     total_items: number;
     halls: number;
@@ -93,11 +96,21 @@ export type Stats = {
     last_day: string;
     percent: Record<DietKey, number>;
     avg_nutrition: Record<"calories" | "carbohydrates_grams" | "protein_grams" | "saturated_fat_grams", number>;
-  };
+  } | null;
   halls: HallStats[];
+  /** The single day the stats were scoped to, or null for the full window. */
+  scope_date: string | null;
+  /**
+   * The week-over-week comparison target when a single day is scoped: the same
+   * weekday seven days later. `available` is false when that day has no data,
+   * so per-hall `change_*` values come back null. Null for the full window.
+   */
+  next_week: { date: string | null; available: boolean } | null;
 };
 
-export const getStats = () => apiGet<Stats>("/api/stats");
+/** Stats for the whole window, or for one service day when `date` is given. */
+export const getStats = (date?: string | null) =>
+  apiGet<Stats>("/api/stats", date ? { date } : {});
 
 export const getMetadata = () =>
   apiGet<{ halls: ApiHall[]; campuses: string[]; dates: string[]; meals: string[] }>("/api/metadata");
